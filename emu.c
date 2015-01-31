@@ -652,8 +652,6 @@ static kern_return_t emu_readelf(task_t task, thread_t thread, void *image) {
         ASSERT(ehdr->e_type == ET_EXEC);
         ASSERT(ehdr->e_machine == EM_X86_64);
 
-        int executable_stack = 0;
-
         for(int i = 0; i < ehdr->e_phnum; i++) {
                 Elf64_Phdr *phdr = (Elf64_Phdr*) ((uint8_t*)image +
                         ehdr->e_phoff + i * ehdr->e_phentsize);
@@ -671,34 +669,61 @@ static kern_return_t emu_readelf(task_t task, thread_t thread, void *image) {
                         if(phdr->p_filesz > 0) {
                                 vm_address_t source_addr = (vm_address_t) image + phdr->p_offset;
                                 vm_address_t target_addr = (vm_address_t) phdr->p_vaddr;
-
-                                DEBUG("src %016lx dst %016lx sz %016llx",
-                                      source_addr, target_addr, phdr->p_filesz);
+                                // DEBUG("src %016lx dst %016lx sz %016llx",
+                                //       source_addr, target_addr, phdr->p_filesz);
 
                                 vm_prot_t cur, max;
                                 if((retval = vm_remap(task, &target_addr, phdr->p_filesz,
                                                 0, FALSE, mach_task_self(), source_addr,
                                                 TRUE, &cur, &max, VM_INHERIT_NONE)))
-                                        FAIL("vm_allocate", retval);
-
-                                DEBUG("dst %016lx", target_addr);
-                                ASSERT(target_addr == (vm_address_t) phdr->p_vaddr);
+                                        FAIL("vm_remap", retval);
                         }
+
+                        if(phdr->p_memsz > phdr->p_filesz) {
+                                vm_address_t target_addr = (vm_address_t)
+                                        i386_round_page(phdr->p_vaddr + phdr->p_filesz);
+                                vm_size_t delta = phdr->p_vaddr + phdr->p_filesz - target_addr;
+                                // DEBUG("dst %016lx delta %016lx sz %016llx",
+                                //       target_addr, delta, phdr->p_memsz - delta);
+
+                                if(delta > 0) {
+                                        if((retval = vm_allocate(task, &target_addr,
+                                                        phdr->p_memsz - delta, FALSE)))
+                                                FAIL("vm_allocate:pt_load", retval);
+                                }
+                        }
+
+                        if((retval = vm_protect(task, (vm_address_t) phdr->p_vaddr,
+                                        phdr->p_memsz, FALSE, vm_prot)))
+                                FAIL("vm_protect:pt_load", retval);
 
                         break;
                 }
 
                 case PT_GNU_STACK:
-                        executable_stack = !!(phdr->p_flags & PF_X);
+                        ASSERT(!(phdr->p_flags & PF_X));
                         break;
 
                 default:
-                        PFAIL("unknown phdr->p_type");
+                        DEBUG("phdr type %04x", phdr->p_type);
+                        PFAIL("unknown phdr type");
                 }
         }
 
+        vm_size_t stack_size = 0x1000 * 64;
+        vm_address_t stack_top = 0x7fff00000000, stack_addr = stack_top - stack_size;
+        DEBUG("stack dst %016lx sz %016lx", stack_addr, stack_size);
+
+        if((retval = vm_allocate(task, &stack_addr, stack_size, FALSE)))
+                FAIL("vm_allocate:stack", retval);
+
+        if((retval = vm_protect(task, stack_addr, stack_size, FALSE,
+                        VM_PROT_WRITE | VM_PROT_READ)))
+                FAIL("vm_protect:stack", retval);
+
         x86_thread_state64_t state = {0};
         state.__rip = ehdr->e_entry;
+        state.__rsp = stack_top - 0x80; /* offset to make rsp printer work */
         if((retval = thread_set_state(thread, x86_THREAD_STATE64, (natural_t*) &state,
                         sizeof(x86_thread_state64_t) / sizeof(natural_t))))
                 FAIL("thread_set_state", retval);
