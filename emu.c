@@ -6,17 +6,21 @@
 #include <stdarg.h>
 #include <mach/mach.h>
 #include <mach/mig.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/Disassembler.h>
 
 #include <bits/syscall.h>
 #include <asm-generic/errno.h>
 
 #ifndef NDEBUG
+#define DEBUG1(str) fprintf(stderr, "d: %s: " str "\n", __func__)
 #define DEBUG(fmt, ...) fprintf(stderr, "d: %s: " fmt "\n", __func__, __VA_ARGS__)
 #define PFAIL(reason) do { pfail(__func__, reason); goto fail; } while(0)
 #define FAIL(reason, retval) do { fail(__func__, reason, retval); goto fail; } while(0)
 #define XFAIL(reason, retval) fail(__func__, "cleanup:" reason, retval)
 #define ASSERT(reason, retval) do { fail(__func__, reason, retval); abort(); } while(0)
 #else
+#define DEBUG1(...) do ; while(0)
 #define DEBUG(...) do ; while(0)
 #define PFAIL(reason) goto fail
 #define FAIL(reason, retval) goto fail
@@ -485,13 +489,13 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
                 FAIL("mach_msg_receive", retval);
 
         x86_thread_state64_t *state = (x86_thread_state64_t*) exn_req.state;
+        syscall_context_t context = {
+                .sysret_port = exn_req.hdr.msgh_remote_port,
+                .task = exn_req.task_port.name,
+                .thread = exn_req.thread_port.name,
+        };
 
         if(exn_req.exception == EXC_SYSCALL) {
-                syscall_context_t context = {
-                        .sysret_port = exn_req.hdr.msgh_remote_port,
-                        .task = exn_req.task_port.name,
-                        .thread = exn_req.thread_port.name,
-                };
                 emu_syscall(&context, state);
         } else {
                 const char* exn_str = "(unknown)";
@@ -516,7 +520,66 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
                 DEBUG("exception %d (%s) %016llx %016llx",
                       exn_req.exception, exn_str, exn_req.code[0], exn_req.code[1]);
                 PRINT_STATE(*state);
-                task_terminate(exn_req.task_port.name);
+
+                uint64_t stack[10] = {0xBAAAAAAAAAAAAAAD};
+                uint64_t rsp_low = state->__rsp;
+                vm_size_t rsp_len = sizeof(stack) / sizeof(natural_t);
+                if((retval = vm_read_overwrite(context.task, rsp_low, sizeof(stack),
+                                (pointer_t) stack, &rsp_len)))
+                        FAIL("vm_read_overwrite:stack", retval);
+
+                DEBUG1("stack:");
+                for(int i = 0; i < sizeof(stack) / sizeof(stack[0]); i++) {
+                        const char *arrow =
+                                (rsp_low + i * sizeof(stack[0]) == state->__rsp) ? "=>" : "  ";
+                        DEBUG(" %s %016llx: %016llx", arrow,
+                              rsp_low + i * sizeof(stack[0]), stack[i]);
+                }
+
+                uint8_t insns_begin[256];
+                uint8_t *insns = insns_begin, *insns_end;
+                vm_size_t rip_len = sizeof(insns_begin) / sizeof(natural_t);
+                if((retval = vm_read_overwrite(context.task, state->__rip, sizeof(insns_begin),
+                                (pointer_t) insns_begin, &rip_len)))
+                        FAIL("vm_read_overwrite:insns", retval);
+                insns_end = insns_begin + rip_len * sizeof(natural_t);
+
+                LLVMInitializeAllTargetInfos();
+                LLVMInitializeAllTargetMCs();
+                LLVMInitializeAllDisassemblers();
+                LLVMDisasmContextRef Disasm = LLVMCreateDisasm(
+                        "x86_64-apple-darwin12.6.0", NULL, 0, NULL, NULL);
+                if(!Disasm)
+                        PFAIL("LLVMCreateDisasm");
+
+                DEBUG1("disasm:");
+                for(int i = 0; i < 10; i++) {
+                        char mnemonic[256] = {0};
+                        uint64_t rip = state->__rip + (insns - insns_begin);
+                        size_t insn_len = LLVMDisasmInstruction(Disasm, insns, insns_end - insns,
+                                rip, mnemonic, sizeof(mnemonic));
+
+                        char bytes[3 * 8 + 1] = {0x20};
+                        int j;
+                        for(j = 0; j < insn_len; j++) {
+                                snprintf(bytes + (j % 8) * 3, 4, "%02x ", insns[j]);
+                                if(j > 0 && j % 8 == 7) {
+                                        DEBUG(" %s %016llx: %s", (i == 0 && j == 7 ? "=>" : "  "),
+                                              rip + j - 7, bytes);
+                                        memset(bytes, 0x20, sizeof(bytes));
+                                }
+                        }
+                        memset(bytes + strlen(bytes), 0x20, sizeof(bytes) - strlen(bytes));
+
+                        DEBUG(" %s %016llx: %s %s",
+                              (i == 0 && j < 8 ? "=>" : "  "), rip + j - (j % 8), bytes, mnemonic);
+
+                        insns += insn_len;
+                }
+
+                LLVMDisasmDispose(Disasm);
+
+                task_terminate(context.task);
         }
 
 fail:

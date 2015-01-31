@@ -1,8 +1,6 @@
 .text
 .globl start
 start:
-        movq %fs:0x0, %rax
-
         movq $1, %rax
         movq $1, %rdi
         leaq msg(%rip), %rsi
