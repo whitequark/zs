@@ -1,11 +1,11 @@
-all: linux emulinux
+all: app emu
 
-emulinux: emulinux.c
-	clang -g2 $^ -o $@
+emu: emu.c
+	clang -g2 -Iinclude -Wall -Werror -Wno-unused-function $^ -o $@
 
-linux: linux.s
+app: app.s
 	clang -c $^
 	ld $(patsubst %.s,%.o,$^) -o $@
 
 clean:
-	rm -f *.o emulinux emulinux.dSYM linux
+	rm -f *.o emu emu.dSYM linux

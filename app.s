@@ -1,10 +1,6 @@
 .text
 .globl start
 start:
-        movq $0x1122334455667788, %rax
-        movq $0x99AABBCCDDEEFF00, %r15
-        syscall
-
         movq $1, %rax
         movq $1, %rdi
         leaq msg(%rip), %rsi
