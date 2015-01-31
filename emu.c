@@ -130,8 +130,11 @@ static kern_return_t emu_spawn(mach_port_t *task) {
         if((retval = task_set_bootstrap_port(mach_task_self(), send)))
                 FAIL("task_set_bootstrap_port", retval);
 
-        if(!fork())
+        pid_t pid;
+        if(!(pid = fork()))
                 emu_spawn_helper();
+
+        DEBUG("pid %d", pid);
 
         if((retval = task_set_bootstrap_port(mach_task_self(), old_bootstrap)))
                 FAIL("task_set_bootstrap_port", retval);
@@ -178,7 +181,7 @@ fail:
 
 static kern_return_t emu_spawn_task(mach_port_t exn_set) {
         kern_return_t retval, xretval;
-        mach_port_t task = 0, exn = 0, exn_send = 0;
+        mach_port_t task = 0, syscall = 0, syscall_send = 0;
         mach_msg_type_name_t type;
         thread_array_t threads = NULL;
         mach_msg_type_number_t thread_count;
@@ -186,21 +189,21 @@ static kern_return_t emu_spawn_task(mach_port_t exn_set) {
         if((retval = emu_spawn(&task)))
                 FAIL("emu_spawn", retval);
 
-        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exn)))
+        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &syscall)))
                 FAIL("mach_port_allocate", retval);
 
-        //DEBUG("exn port %d", exn);
+        //DEBUG("syscall port %d", syscall);
 
         if((retval = mach_port_extract_right(mach_task_self(),
-                        exn, MACH_MSG_TYPE_MAKE_SEND, &exn_send, &type)))
+                        syscall, MACH_MSG_TYPE_MAKE_SEND, &syscall_send, &type)))
                 FAIL("mach_port_extract_right", retval);
 
-        if((retval = mach_port_move_member(mach_task_self(), exn, exn_set)))
+        if((retval = mach_port_move_member(mach_task_self(), syscall, exn_set)))
                 FAIL("mach_port_move_member", retval);
 
         if((retval = task_set_exception_ports(task,
-                        EXC_MASK_SYSCALL, exn_send,
-                        EXCEPTION_STATE_IDENTITY, x86_THREAD_STATE64)))
+                        EXC_MASK_ALL, syscall_send,
+                        EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES, x86_THREAD_STATE64)))
                 FAIL("task_set_exception_ports", retval);
 
         if((retval = task_threads(task, &threads, &thread_count)))
@@ -228,7 +231,7 @@ fail:
 #define SYSCALL_SUSPEND 0x7fffffffffffffff
 
 typedef struct {
-        mach_port_t exn_port;
+        mach_port_t sysret_port;
         mach_port_t task;
         mach_port_t thread;
 } syscall_context_t;
@@ -459,7 +462,7 @@ static void emu_syscall(syscall_context_t *context, x86_thread_state64_t *state)
 #undef SYSCALL5
 #undef SYSCALL6
 
-static kern_return_t emu_syscall_wait(mach_port_t exn_set) {
+static kern_return_t emu_exn_wait(mach_port_t exn_set) {
         kern_return_t retval;
 
         struct {
@@ -470,7 +473,7 @@ static kern_return_t emu_syscall_wait(mach_port_t exn_set) {
                 NDR_record_t NDR;
                 exception_type_t exception;
                 mach_msg_type_number_t code_len;
-                int32_t code[2];
+                int64_t code[2];
                 int flavor;
                 mach_msg_type_number_t state_len;
                 natural_t state[sizeof(x86_thread_state64_t) / sizeof(natural_t)];
@@ -481,23 +484,40 @@ static kern_return_t emu_syscall_wait(mach_port_t exn_set) {
         if((retval = mach_msg_receive(&exn_req.hdr)))
                 FAIL("mach_msg_receive", retval);
 
-        //DEBUG("bits %08x", exn_req.hdr.msgh_bits);
-        // DEBUG("remote %d %08x thread %d task %d",
-        //       exn_req.hdr.msgh_remote_port, exn_req.hdr.msgh_bits,
-        //       exn_req.thread_port.name, exn_req.task_port.name);
-        // DEBUG("exn %d code[%d] %08x %08x flavor %d state[%d]",
-        //      exn_req.exception,
-        //      exn_req.code_len, exn_req.code[0], exn_req.code[1],
-        //      exn_req.flavor, exn_req.state_len);
-
-        syscall_context_t context = {
-                .exn_port = exn_req.hdr.msgh_remote_port,
-                .task = exn_req.task_port.name,
-                .thread = exn_req.thread_port.name,
-        };
         x86_thread_state64_t *state = (x86_thread_state64_t*) exn_req.state;
 
-        emu_syscall(&context, state);
+        if(exn_req.exception == EXC_SYSCALL) {
+                syscall_context_t context = {
+                        .sysret_port = exn_req.hdr.msgh_remote_port,
+                        .task = exn_req.task_port.name,
+                        .thread = exn_req.thread_port.name,
+                };
+                emu_syscall(&context, state);
+        } else {
+                const char* exn_str = "(unknown)";
+                switch(exn_req.exception) {
+                case EXC_BAD_ACCESS: exn_str = "EXC_BAD_ACCESS"; break;
+                case EXC_BAD_INSTRUCTION: exn_str = "EXC_BAD_INSTRUCTION"; break;
+                case EXC_ARITHMETIC: exn_str = "EXC_ARITHMETIC"; break;
+                case EXC_EMULATION: exn_str = "EXC_EMULATION"; break;
+                case EXC_SOFTWARE: exn_str = "EXC_SOFTWARE"; break;
+                case EXC_BREAKPOINT: exn_str = "EXC_BREAKPOINT"; break;
+                case EXC_SYSCALL: exn_str = "EXC_SYSCALL"; break;
+                case EXC_MACH_SYSCALL: exn_str = "EXC_MACH_SYSCALL"; break;
+                case EXC_RPC_ALERT: exn_str = "EXC_RPC_ALERT"; break;
+                case EXC_CRASH: exn_str = "EXC_CRASH"; break;
+                case EXC_RESOURCE: exn_str = "EXC_RESOURCE"; break;
+                default:
+                        if(exn_req.exception >= 0x10000 && exn_req.exception <= 0x1ffff)
+                                exn_str = "Unix signal";
+                        else if(exn_req.exception >= 0x20000 && exn_req.exception <= 0x2ffff)
+                                exn_str = "MACF exception";
+                }
+                DEBUG("exception %d (%s) %016llx %016llx",
+                      exn_req.exception, exn_str, exn_req.code[0], exn_req.code[1]);
+                PRINT_STATE(*state);
+                task_terminate(exn_req.task_port.name);
+        }
 
 fail:
         return retval;
@@ -521,11 +541,12 @@ static void emu_syscall_return(syscall_context_t *context, uint64_t syscall_retv
                 mach_msg_type_number_t state_len;
         } __attribute__((packed)) exn_rep = {{0}};
         exn_rep.hdr.msgh_size = sizeof(exn_rep);
-        exn_rep.hdr.msgh_remote_port = context->exn_port;
+        exn_rep.hdr.msgh_remote_port = context->sysret_port;
         exn_rep.hdr.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_MOVE_SEND_ONCE);
         // TODO: kernel seems to ignore NDR, should we set it?
         //exn_rep.NDR = exn_req.NDR;
         exn_rep.ret_code = KERN_SUCCESS;
+        // TODO: kernel seems to ignore returned state, wtf?
         if((retval = mach_msg_send(&exn_rep.hdr)))
                 FAIL("mach_msg_send", retval);
 
@@ -559,8 +580,8 @@ void happy_dance() {
                 FAIL("emu_spawn_task", retval);
 
         while(TRUE) {
-                if((retval = emu_syscall_wait(exn_set)))
-                        FAIL("emu_syscall_wait", retval);
+                if((retval = emu_exn_wait(exn_set)))
+                        FAIL("emu_exn_wait", retval);
         }
 
 fail:
