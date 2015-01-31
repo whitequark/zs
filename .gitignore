@@ -1,4 +1,5 @@
 *.dSYM
 *.o
-app
 emu
+empty
+app
