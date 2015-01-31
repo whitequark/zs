@@ -527,23 +527,27 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
                 vm_size_t rsp_len = sizeof(stack) / sizeof(natural_t);
                 if((retval = vm_read_overwrite(context.task, rsp_low, sizeof(stack),
                                 (pointer_t) stack, &rsp_len))) {
-                        DEBUG1("invalid stack");
-                } else {
-                        DEBUG1("stack:");
-                        for(int i = 0; i < sizeof(stack) / sizeof(stack[0]); i++) {
-                                const char *arrow =
-                                        (rsp_low + i * sizeof(stack[0]) == state->__rsp) ? "=>" : "  ";
-                                DEBUG(" %s %016llx: %016llx", arrow,
-                                      rsp_low + i * sizeof(stack[0]), stack[i]);
-                        }
+                        DEBUG1("rsp points to nowhere");
+                        goto nostack;
                 }
+
+                DEBUG1("stack:");
+                for(int i = 0; i < sizeof(stack) / sizeof(stack[0]); i++) {
+                        const char *arrow =
+                                (rsp_low + i * sizeof(stack[0]) == state->__rsp) ? "=>" : "  ";
+                        DEBUG(" %s %016llx: %016llx", arrow,
+                              rsp_low + i * sizeof(stack[0]), stack[i]);
+                }
+nostack: ;
 
                 uint8_t insns_begin[256];
                 uint8_t *insns = insns_begin, *insns_end;
                 vm_size_t rip_len = sizeof(insns_begin) / sizeof(natural_t);
                 if((retval = vm_read_overwrite(context.task, state->__rip, sizeof(insns_begin),
-                                (pointer_t) insns_begin, &rip_len)))
-                        FAIL("vm_read_overwrite:insns", retval);
+                                (pointer_t) insns_begin, &rip_len))) {
+                        DEBUG1("rip points to nowhere");
+                        goto nodisasm;
+                }
                 insns_end = insns_begin + rip_len * sizeof(natural_t);
 
                 LLVMInitializeAllTargetInfos();
@@ -581,6 +585,7 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
                 }
 
                 LLVMDisasmDispose(Disasm);
+nodisasm: ;
 
                 task_terminate(context.task);
 
