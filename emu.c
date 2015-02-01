@@ -14,6 +14,7 @@
 
 #include <bits/syscall.h>
 #include <asm-generic/errno.h>
+#include <asm/prctl.h>
 #include <elf.h>
 
 #define DEBUG1(str) fprintf(stderr, "d: %s: " str "\n", __func__)
@@ -25,197 +26,8 @@
 #define XUFAIL(reason) fprintf(stderr, "e: %s: cleanup: %s: %s\n", __func__, reason, strerror(errno))
 #define ASSERT(expr) do { if(!(expr)) { fprintf(stderr, "e: %s: failed: %s\n", __func__, #expr); goto fail; } } while(0)
 
-#define PRINT_STATE(state) \
-        do { \
-            DEBUG("RAX %016llx R8  %016llx", (state).__rax, (state).__r8); \
-            DEBUG("RBX %016llx R9  %016llx", (state).__rbx, (state).__r9); \
-            DEBUG("RCX %016llx R10 %016llx", (state).__rcx, (state).__r10); \
-            DEBUG("RDX %016llx R11 %016llx", (state).__rdx, (state).__r11); \
-            DEBUG("RDI %016llx R12 %016llx", (state).__rdi, (state).__r12); \
-            DEBUG("RSI %016llx R13 %016llx", (state).__rsi, (state).__r13); \
-            DEBUG("RBP %016llx R14 %016llx", (state).__rbp, (state).__r14); \
-            DEBUG("RSP %016llx R15 %016llx", (state).__rsp, (state).__r15); \
-            DEBUG("CS:RIP %04x:%016llx FS %04x GS %04x", \
-                  (uint16_t) (state).__cs, (state).__rip, \
-                  (uint16_t) (state).__fs, (uint16_t) (state).__gs); \
-            DEBUG("RFLAGS %016llx", (state).__rflags); \
-        } while(0)
-
 static void fail(const char *fn, const char *reason, kern_return_t retval) {
         fprintf(stderr, "e: %s: %s: %08x %s\n", fn, reason, retval, mach_error_string(retval));
-}
-
-/* do the port swap dance in newly forked task */
-static void emu_spawn_helper() {
-        kern_return_t retval;
-
-        mach_port_t send;
-        if((retval = task_get_bootstrap_port(mach_task_self(), &send)))
-                FAIL("task_get_bootstrap_port", retval);
-
-        mach_port_t reply;
-        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply)))
-                FAIL("mach_port_allocate", retval);
-
-        // DEBUG("send %d reply %d", send, reply);
-
-        /* send reply port and self rights */
-        struct {
-                mach_msg_header_t hdr;
-                mach_msg_body_t body;
-                mach_msg_port_descriptor_t task_port;
-        } task_msg = {{0}};
-        task_msg.hdr.msgh_size = sizeof(task_msg);
-        task_msg.hdr.msgh_bits =
-                MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND) |
-                MACH_MSGH_BITS_COMPLEX;
-        task_msg.hdr.msgh_remote_port = send;
-        task_msg.hdr.msgh_local_port = reply;
-        task_msg.body.msgh_descriptor_count = 1;
-        task_msg.task_port.name = mach_task_self();
-        task_msg.task_port.disposition = MACH_MSG_TYPE_COPY_SEND;
-        task_msg.task_port.type = MACH_MSG_PORT_DESCRIPTOR;
-        if((retval = mach_msg_send(&task_msg.hdr)))
-                FAIL("mach_msg_send", retval);
-
-        /* receive old bootstrap port */
-        struct {
-                mach_msg_header_t hdr;
-                mach_msg_trailer_t trail;
-        } bootstrap_msg = {{0}};
-        bootstrap_msg.hdr.msgh_size = sizeof(bootstrap_msg);
-        bootstrap_msg.hdr.msgh_local_port = reply;
-        if((retval = mach_msg_receive(&bootstrap_msg.hdr)))
-                FAIL("mach_msg_receive:bootstrap", retval);
-
-        mach_port_t old_bootstrap = bootstrap_msg.hdr.msgh_remote_port;
-        // DEBUG("bootstrap %d", old_bootstrap);
-
-        if((retval = task_set_bootstrap_port(mach_task_self(), old_bootstrap)))
-                FAIL("task_set_bootstrap_port", retval);
-
-        char *argv[] = {0}, *envp[] = {0};
-        execve("./empty", argv, envp);
-
-fail:
-        exit(1);
-}
-
-/* spawn a new suspended task */
-static kern_return_t emu_spawn(mach_port_t exn, mach_port_t *task) {
-        kern_return_t retval, xretval;
-        mach_port_t recv = 0, reply = 0, child = 0;
-
-        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &recv)))
-                FAIL("mach_port_allocate", retval);
-
-        if((retval = mach_port_insert_right(mach_task_self(),
-                        recv, recv, MACH_MSG_TYPE_MAKE_SEND)))
-                FAIL("mach_port_insert_right", retval);
-
-        mach_port_t old_bootstrap = 0;
-        if((retval = task_get_bootstrap_port(mach_task_self(), &old_bootstrap)))
-                FAIL("task_get_bootstrap_port", retval);
-
-        if((retval = task_set_bootstrap_port(mach_task_self(), recv)))
-                FAIL("task_set_bootstrap_port", retval);
-
-        pid_t pid;
-        if(!(pid = fork()))
-                emu_spawn_helper();
-
-        DEBUG("pid %d", pid);
-
-        if((retval = task_set_bootstrap_port(mach_task_self(), old_bootstrap)))
-                FAIL("task_set_bootstrap_port", retval);
-
-        struct {
-                mach_msg_header_t hdr;
-                mach_msg_body_t body;
-                mach_msg_port_descriptor_t task_port;
-                mach_msg_trailer_t trail;
-        } task_msg = {{0}};
-        task_msg.hdr.msgh_size = sizeof(task_msg);
-        task_msg.hdr.msgh_local_port = recv;
-        if((retval = mach_msg_receive(&task_msg.hdr)))
-                FAIL("mach_msg_receive:task", retval);
-
-        reply = task_msg.hdr.msgh_remote_port;
-        child = task_msg.task_port.name;
-        //DEBUG("got reply %d task %d", reply, child);
-
-        if((retval = task_set_exception_ports(child,
-                        EXC_MASK_ALL, exn,
-                        EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES, x86_THREAD_STATE64)))
-                FAIL("task_set_exception_ports", retval);
-
-        mach_msg_header_t bootstrap_msg = {0};
-        bootstrap_msg.msgh_size = sizeof(bootstrap_msg);
-        bootstrap_msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND);
-        bootstrap_msg.msgh_remote_port = reply;
-        bootstrap_msg.msgh_local_port = old_bootstrap;
-        if((retval = mach_msg_send(&bootstrap_msg)))
-                FAIL("mach_msg_send:bootstrap", retval);
-
-        *task = child;
-
-fail:
-        if(retval) {
-                if(child && (xretval = mach_port_deallocate(mach_task_self(), child)))
-                        XFAIL("mach_port_deallocate:child", xretval);
-        }
-
-        if(recv && (xretval = mach_port_deallocate(mach_task_self(), recv)))
-                XFAIL("mach_port_deallocate:recv", xretval);
-
-        if(reply && (xretval = mach_port_deallocate(mach_task_self(), reply)))
-                XFAIL("mach_port_deallocate:reply", xretval);
-
-        return retval;
-}
-
-static kern_return_t emu_exn_wait(mach_port_t exn_set);
-
-static kern_return_t emu_blank_slate(mach_port_t exn_set, task_t *task, thread_t *thread) {
-        kern_return_t retval, xretval;
-        mach_port_t exn = 0;
-        thread_array_t threads = NULL;
-        mach_msg_type_number_t thread_count = 0;
-
-        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exn)))
-                FAIL("mach_port_allocate", retval);
-
-        if((retval = mach_port_insert_right(mach_task_self(),
-                        exn, exn, MACH_MSG_TYPE_MAKE_SEND)))
-                FAIL("mach_port_insert_right", retval);
-
-        //DEBUG("exn port %d", exn);
-
-        if((retval = emu_spawn(exn, task)))
-                FAIL("emu_spawn", retval);
-
-        if((retval = emu_exn_wait(exn)))
-                FAIL("emu_exn_wait", retval);
-
-        if((retval = mach_port_move_member(mach_task_self(), exn, exn_set)))
-                FAIL("mach_port_move_member", retval);
-
-        if((retval = task_threads(*task, &threads, &thread_count)))
-                FAIL("task_threads", retval);
-
-        *thread = threads[0];
-
-fail:
-        if(retval) {
-                if(task && (xretval = mach_port_deallocate(mach_task_self(), *task)))
-                        XFAIL("mach_port_deallocate:task", xretval);
-        }
-
-        if(threads && (xretval = vm_deallocate(mach_task_self(),
-                        (vm_address_t) threads, sizeof(thread_t) * thread_count)))
-                XFAIL("vm_deallocate:threads", xretval);
-
-        return retval;
 }
 
 #define SYSCALL_SUSPEND 0x7fffffffffffffff
@@ -228,6 +40,23 @@ typedef struct {
 } syscall_context_t;
 
 static kern_return_t emu_exn_return(syscall_context_t *context);
+
+static void emu_dump_mem(syscall_context_t *context, uint64_t base, uint64_t len) {
+        kern_return_t retval;
+
+        len += (len % 8 == 0) ? 0 : 8 - len % 8;
+
+        uint64_t *local = (uint64_t*) alloca(len);
+        vm_size_t vm_len = len / sizeof(natural_t);
+        if((retval = vm_read_overwrite(context->task, base, len, (pointer_t) local, &vm_len)))
+                FAIL("vm_read_overwrite", retval);
+
+        for(int i = 0; i < len / sizeof(uint64_t); i++) {
+                DEBUG(" %016llx: %016llx", base + i * sizeof(uint64_t), local[i]);
+        }
+
+fail:   ;
+}
 
 static inline void* emu_map(syscall_context_t *context,
                             uint64_t ptr, uint64_t len, vm_prot_t prot) {
@@ -246,7 +75,7 @@ static inline void* emu_map(syscall_context_t *context,
                         PFAIL("perm:ro");
         }
 
-        return out;
+        return (void*)((uint64_t)out + ptr % PAGE_SIZE);
 
 fail:   return NULL;
 }
@@ -261,8 +90,11 @@ static inline const void* emu_map_ro(syscall_context_t *context, uint64_t ptr, u
 
 static inline void emu_unmap(syscall_context_t *context, const void *obj, uint64_t len) {
         kern_return_t retval;
-        if((retval = vm_deallocate(mach_task_self(), (vm_address_t) obj, (vm_size_t) len)))
+        if((retval = vm_deallocate(mach_task_self(),
+                        (vm_address_t) obj & PAGE_MASK, (vm_size_t) len)))
                 FAIL("vm_deallocate", retval);
+
+        return;
 
 fail:   abort();
 }
@@ -273,142 +105,139 @@ static inline int emu_ret(int ret) {
         switch(ret) {
         default: fail(__func__, "unknown errno %d\n", -ret); return -EIO;
 #define ERRNO(x) case -x: return -linux_ ## x;
-        ERRNO(EPERM)
-        ERRNO(ENOENT)
-        ERRNO(ESRCH)
-        ERRNO(EINTR)
-        ERRNO(EIO)
-        ERRNO(ENXIO)
-        ERRNO(E2BIG)
-        ERRNO(ENOEXEC)
-        ERRNO(EBADF)
-        ERRNO(ECHILD)
-        ERRNO(EDEADLK)
-        ERRNO(ENOMEM)
-        ERRNO(EACCES)
-        ERRNO(EFAULT)
-        ERRNO(ENOTBLK)
-        ERRNO(EBUSY)
-        ERRNO(EEXIST)
-        ERRNO(EXDEV)
-        ERRNO(ENODEV)
-        ERRNO(ENOTDIR)
-        ERRNO(EISDIR)
-        ERRNO(EINVAL)
-        ERRNO(ENFILE)
-        ERRNO(EMFILE)
-        ERRNO(ENOTTY)
-        ERRNO(ETXTBSY)
-        ERRNO(EFBIG)
-        ERRNO(ENOSPC)
-        ERRNO(ESPIPE)
-        ERRNO(EROFS)
-        ERRNO(EMLINK)
-        ERRNO(EPIPE)
-        ERRNO(EDOM)
-        ERRNO(ERANGE)
-        ERRNO(EAGAIN)
-        ERRNO(EINPROGRESS)
-        ERRNO(EALREADY)
-        ERRNO(ENOTSOCK)
-        ERRNO(EDESTADDRREQ)
-        ERRNO(EMSGSIZE)
-        ERRNO(EPROTOTYPE)
-        ERRNO(ENOPROTOOPT)
-        ERRNO(EPROTONOSUPPORT)
-        ERRNO(ESOCKTNOSUPPORT)
+        ERRNO(EPERM)            ERRNO(ENOENT)           ERRNO(ESRCH)
+        ERRNO(EINTR)            ERRNO(EIO)              ERRNO(ENXIO)
+        ERRNO(E2BIG)            ERRNO(ENOEXEC)          ERRNO(EBADF)
+        ERRNO(ECHILD)           ERRNO(EDEADLK)          ERRNO(ENOMEM)
+        ERRNO(EACCES)           ERRNO(EFAULT)           ERRNO(ENOTBLK)
+        ERRNO(EBUSY)            ERRNO(EEXIST)           ERRNO(EXDEV)
+        ERRNO(ENODEV)           ERRNO(ENOTDIR)          ERRNO(EISDIR)
+        ERRNO(EINVAL)           ERRNO(ENFILE)           ERRNO(EMFILE)
+        ERRNO(ENOTTY)           ERRNO(ETXTBSY)          ERRNO(EFBIG)
+        ERRNO(ENOSPC)           ERRNO(ESPIPE)           ERRNO(EROFS)
+        ERRNO(EMLINK)           ERRNO(EPIPE)            ERRNO(EDOM)
+        ERRNO(ERANGE)           ERRNO(EAGAIN)           ERRNO(EALREADY)
+        ERRNO(ENOTSOCK)         ERRNO(EDESTADDRREQ)     ERRNO(EMSGSIZE)
+        ERRNO(EPROTOTYPE)       ERRNO(EINPROGRESS)      ERRNO(ENOPROTOOPT)
+        ERRNO(EPROTONOSUPPORT)  ERRNO(ESOCKTNOSUPPORT)  ERRNO(EOPNOTSUPP)
+        ERRNO(EPFNOSUPPORT)     ERRNO(EAFNOSUPPORT)     ERRNO(EADDRINUSE)
+        ERRNO(EADDRNOTAVAIL)    ERRNO(ENETDOWN)         ERRNO(ENETUNREACH)
+        ERRNO(ENETRESET)        ERRNO(ECONNABORTED)     ERRNO(ECONNRESET)
+        ERRNO(ENOBUFS)          ERRNO(EISCONN)          ERRNO(ENOTCONN)
+        ERRNO(ESHUTDOWN)        ERRNO(ETOOMANYREFS)     ERRNO(ETIMEDOUT)
+        ERRNO(ECONNREFUSED)     ERRNO(ELOOP)            ERRNO(ENAMETOOLONG)
+        ERRNO(EHOSTDOWN)        ERRNO(EHOSTUNREACH)     ERRNO(ENOTEMPTY)
+        ERRNO(EUSERS)           ERRNO(EDQUOT)           ERRNO(ESTALE)
+        ERRNO(EREMOTE)          ERRNO(ENOLCK)           ERRNO(ENOSYS)
+        ERRNO(EOVERFLOW)        ERRNO(ECANCELED)        ERRNO(EIDRM)
+        ERRNO(ENOMSG)           ERRNO(EILSEQ)           ERRNO(EBADMSG)
+        ERRNO(EMULTIHOP)        ERRNO(ENODATA)          ERRNO(ENOLINK)
+        ERRNO(ENOSR)            ERRNO(ENOSTR)           ERRNO(EPROTO)
+        ERRNO(ETIME)            ERRNO(ENOTRECOVERABLE)  ERRNO(EOWNERDEAD)
         //ERRNO(ENOTSUP)
-        ERRNO(EOPNOTSUPP)
-        ERRNO(EPFNOSUPPORT)
-        ERRNO(EAFNOSUPPORT)
-        ERRNO(EADDRINUSE)
-        ERRNO(EADDRNOTAVAIL)
-        ERRNO(ENETDOWN)
-        ERRNO(ENETUNREACH)
-        ERRNO(ENETRESET)
-        ERRNO(ECONNABORTED)
-        ERRNO(ECONNRESET)
-        ERRNO(ENOBUFS)
-        ERRNO(EISCONN)
-        ERRNO(ENOTCONN)
-        ERRNO(ESHUTDOWN)
-        ERRNO(ETOOMANYREFS)
-        ERRNO(ETIMEDOUT)
-        ERRNO(ECONNREFUSED)
-        ERRNO(ELOOP)
-        ERRNO(ENAMETOOLONG)
-        ERRNO(EHOSTDOWN)
-        ERRNO(EHOSTUNREACH)
-        ERRNO(ENOTEMPTY)
         //ERRNO(EPROCLIM)
-        ERRNO(EUSERS)
-        ERRNO(EDQUOT)
-        ERRNO(ESTALE)
-        ERRNO(EREMOTE)
         //ERRNO(EBADRPC)
         //ERRNO(ERPCMISMATCH)
         //ERRNO(EPROGUNAVAIL)
         //ERRNO(EPROGMISMATCH)
         //ERRNO(EPROCUNAVAIL)
-        ERRNO(ENOLCK)
-        ERRNO(ENOSYS)
         //ERRNO(EFTYPE)
         //ERRNO(EAUTH)
         //ERRNO(ENEEDAUTH)
         //ERRNO(EPWROFF)
         //ERRNO(EDEVERR)
-        ERRNO(EOVERFLOW)
         //ERRNO(EBADEXEC)
         //ERRNO(EBADARCH)
         //ERRNO(ESHLIBVERS)
         //ERRNO(EBADMACHO)
-        ERRNO(ECANCELED)
-        ERRNO(EIDRM)
-        ERRNO(ENOMSG)
-        ERRNO(EILSEQ)
         //ERRNO(ENOATTR)
-        ERRNO(EBADMSG)
-        ERRNO(EMULTIHOP)
-        ERRNO(ENODATA)
-        ERRNO(ENOLINK)
-        ERRNO(ENOSR)
-        ERRNO(ENOSTR)
-        ERRNO(EPROTO)
-        ERRNO(ETIME)
         //ERRNO(ENOPOLICY)
-        ERRNO(ENOTRECOVERABLE)
-        ERRNO(EOWNERDEAD)
         //ERRNO(EQFULL)
 #undef ERRNO
         }
 }
 
-static uint64_t emu_write(syscall_context_t *context,
-                          uint64_t fd, uint64_t ptr, uint64_t len) {
-        DEBUG("fd %lld ptr %016llx len %lld", fd, ptr, len);
+struct linux_iovec {
+        void *iov_base;
+        size_t iov_len;
+};
 
-        const void *obj;
-        if(!(obj = emu_map_ro(context, ptr, len)))
+static uint64_t emu_write(syscall_context_t *context,
+                uint64_t fd, uint64_t user_ptr, uint64_t len) {
+        DEBUG("fd %lld user_ptr %016llx len %lld", fd, user_ptr, len);
+
+        const void *ptr;
+        if(!(ptr = emu_map_ro(context, user_ptr, len)))
                 return -linux_EFAULT;
 
-        int ret = emu_ret(write(fd, obj, len));
+        int ret = emu_ret(write(fd, ptr, len));
 
-        emu_unmap(context, obj, len);
+        emu_unmap(context, ptr, len);
+
+        return ret;
+}
+
+static uint64_t emu_writev(syscall_context_t *context,
+                uint64_t fd, uint64_t user_iov, uint64_t vlen) {
+        DEBUG("fd %lld user_iov %016llx vlen %lld", fd, user_iov, vlen);
+
+        const struct linux_iovec *iov;
+        if(!(iov = emu_map_ro(context, user_iov, vlen * sizeof(struct linux_iovec))))
+                return -linux_EFAULT;
+
+        int ret = 0;
+        for(int i = 0; i < vlen; i++) {
+                int pret;
+                if((pret = emu_write(context, fd,
+                                (uint64_t) iov[i].iov_base, iov[i].iov_len)) < 0) {
+                        ret = pret;
+                        goto fail;
+                } else {
+                        ret += pret;
+                }
+        }
+
+fail:   emu_unmap(context, iov, vlen * sizeof(struct linux_iovec));
 
         return ret;
 }
 
 static uint64_t emu_mmap(syscall_context_t *context,
-                         uint64_t start, uint64_t len, uint64_t prot,
-                         uint64_t flags, uint64_t fd, uint64_t off) {
-        DEBUG("start %016llx len %lld prot %08llx flags %08llx fd %lld off %08llx",
-              start, len, prot, flags, fd, off);
+                uint64_t user_start, uint64_t len, uint64_t prot,
+                uint64_t flags, uint64_t fd, uint64_t off) {
+        DEBUG("user_start %016llx len %lld prot %08llx flags %08llx fd %lld off %08llx",
+              user_start, len, prot, flags, fd, off);
+
+        return -linux_ENOSYS;
+}
+
+static uint64_t emu_ioctl(syscall_context_t *contex,
+                uint64_t fd, uint64_t cmd, uint64_t arg) {
+        DEBUG("fd %lld cmd %08llx arg %016llx", fd, cmd, arg);
 
         return -linux_ENOSYS;
 }
 
 static uint64_t emu_exit(syscall_context_t *context,
-                         uint64_t code) {
+                uint64_t code) {
+        DEBUG("code %lld", code);
+        thread_terminate(context->task);
+        return SYSCALL_SUSPEND;
+}
+
+static uint64_t emu_arch_prctl(syscall_context_t *context,
+                uint64_t code, uint64_t user_addr) {
+        DEBUG("code %04llx user_addr %016llx", code, user_addr);
+
+        switch(code) {
+        default:
+                DEBUG("unhandled arch_prctl(%04llx)", code);
+                return -linux_EINVAL;
+        }
+}
+
+static uint64_t emu_exit_group(syscall_context_t *context,
+                uint64_t code) {
         DEBUG("code %lld", code);
         task_terminate(context->task);
         return SYSCALL_SUSPEND;
@@ -442,8 +271,12 @@ static boolean_t emu_syscall(syscall_context_t *context) {
 
         switch(state->__rax) {
                 SYSCALL3(write);
-                //SYSCALL6(mmap);
+                SYSCALL6(mmap);
+                SYSCALL3(ioctl);
+                SYSCALL3(writev);
                 SYSCALL1(exit);
+                SYSCALL2(arch_prctl);
+                SYSCALL1(exit_group);
 
         /* pseudo-syscall indicating macho stub handoff */
         case 0xffff:
@@ -529,7 +362,15 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
                 }
                 DEBUG("exception %d (%s) %016llx %016llx",
                       exn_req.exception, exn_str, exn_req.code[0], exn_req.code[1]);
-                PRINT_STATE(*state);
+                DEBUG("RAX %016llx R8  %016llx", state->__rax, state->__r8);
+                DEBUG("RBX %016llx R9  %016llx", state->__rbx, state->__r9);
+                DEBUG("RCX %016llx R10 %016llx", state->__rcx, state->__r10);
+                DEBUG("RDX %016llx R11 %016llx", state->__rdx, state->__r11);
+                DEBUG("RDI %016llx R12 %016llx", state->__rdi, state->__r12);
+                DEBUG("RSI %016llx R13 %016llx", state->__rsi, state->__r13);
+                DEBUG("RBP %016llx R14 %016llx", state->__rbp, state->__r14);
+                DEBUG("RSP %016llx R15 %016llx", state->__rsp, state->__r15);
+                DEBUG("RIP %016llx RFLAGS %016llx", state->__rip, state->__rflags);
 
                 uint64_t stack[10] = {0xBAAAAAAAAAAAAAAD};
                 uint64_t rsp_low = state->__rsp;
@@ -748,6 +589,177 @@ fail:
 
         if(fd)
                 close(fd);
+
+        return retval;
+}
+
+/* do the port swap dance in newly forked task */
+static void emu_spawn_helper() {
+        kern_return_t retval;
+
+        mach_port_t send;
+        if((retval = task_get_bootstrap_port(mach_task_self(), &send)))
+                FAIL("task_get_bootstrap_port", retval);
+
+        mach_port_t reply;
+        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply)))
+                FAIL("mach_port_allocate", retval);
+
+        // DEBUG("send %d reply %d", send, reply);
+
+        /* send reply port and self rights */
+        struct {
+                mach_msg_header_t hdr;
+                mach_msg_body_t body;
+                mach_msg_port_descriptor_t task_port;
+        } task_msg = {{0}};
+        task_msg.hdr.msgh_size = sizeof(task_msg);
+        task_msg.hdr.msgh_bits =
+                MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND) |
+                MACH_MSGH_BITS_COMPLEX;
+        task_msg.hdr.msgh_remote_port = send;
+        task_msg.hdr.msgh_local_port = reply;
+        task_msg.body.msgh_descriptor_count = 1;
+        task_msg.task_port.name = mach_task_self();
+        task_msg.task_port.disposition = MACH_MSG_TYPE_COPY_SEND;
+        task_msg.task_port.type = MACH_MSG_PORT_DESCRIPTOR;
+        if((retval = mach_msg_send(&task_msg.hdr)))
+                FAIL("mach_msg_send", retval);
+
+        /* receive old bootstrap port */
+        struct {
+                mach_msg_header_t hdr;
+                mach_msg_trailer_t trail;
+        } bootstrap_msg = {{0}};
+        bootstrap_msg.hdr.msgh_size = sizeof(bootstrap_msg);
+        bootstrap_msg.hdr.msgh_local_port = reply;
+        if((retval = mach_msg_receive(&bootstrap_msg.hdr)))
+                FAIL("mach_msg_receive:bootstrap", retval);
+
+        mach_port_t old_bootstrap = bootstrap_msg.hdr.msgh_remote_port;
+        // DEBUG("bootstrap %d", old_bootstrap);
+
+        if((retval = task_set_bootstrap_port(mach_task_self(), old_bootstrap)))
+                FAIL("task_set_bootstrap_port", retval);
+
+        char *argv[] = {0}, *envp[] = {0};
+        execve("./empty", argv, envp);
+
+fail:
+        exit(1);
+}
+
+/* spawn a new suspended task */
+static kern_return_t emu_spawn(mach_port_t exn, mach_port_t *task) {
+        kern_return_t retval, xretval;
+        mach_port_t recv = 0, reply = 0, child = 0;
+
+        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &recv)))
+                FAIL("mach_port_allocate", retval);
+
+        if((retval = mach_port_insert_right(mach_task_self(),
+                        recv, recv, MACH_MSG_TYPE_MAKE_SEND)))
+                FAIL("mach_port_insert_right", retval);
+
+        mach_port_t old_bootstrap = 0;
+        if((retval = task_get_bootstrap_port(mach_task_self(), &old_bootstrap)))
+                FAIL("task_get_bootstrap_port", retval);
+
+        if((retval = task_set_bootstrap_port(mach_task_self(), recv)))
+                FAIL("task_set_bootstrap_port", retval);
+
+        pid_t pid;
+        if(!(pid = fork()))
+                emu_spawn_helper();
+
+        DEBUG("pid %d", pid);
+
+        if((retval = task_set_bootstrap_port(mach_task_self(), old_bootstrap)))
+                FAIL("task_set_bootstrap_port", retval);
+
+        struct {
+                mach_msg_header_t hdr;
+                mach_msg_body_t body;
+                mach_msg_port_descriptor_t task_port;
+                mach_msg_trailer_t trail;
+        } task_msg = {{0}};
+        task_msg.hdr.msgh_size = sizeof(task_msg);
+        task_msg.hdr.msgh_local_port = recv;
+        if((retval = mach_msg_receive(&task_msg.hdr)))
+                FAIL("mach_msg_receive:task", retval);
+
+        reply = task_msg.hdr.msgh_remote_port;
+        child = task_msg.task_port.name;
+        //DEBUG("got reply %d task %d", reply, child);
+
+        if((retval = task_set_exception_ports(child,
+                        EXC_MASK_ALL, exn,
+                        EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES, x86_THREAD_STATE64)))
+                FAIL("task_set_exception_ports", retval);
+
+        mach_msg_header_t bootstrap_msg = {0};
+        bootstrap_msg.msgh_size = sizeof(bootstrap_msg);
+        bootstrap_msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND);
+        bootstrap_msg.msgh_remote_port = reply;
+        bootstrap_msg.msgh_local_port = old_bootstrap;
+        if((retval = mach_msg_send(&bootstrap_msg)))
+                FAIL("mach_msg_send:bootstrap", retval);
+
+        *task = child;
+
+fail:
+        if(retval) {
+                if(child && (xretval = mach_port_deallocate(mach_task_self(), child)))
+                        XFAIL("mach_port_deallocate:child", xretval);
+        }
+
+        if(recv && (xretval = mach_port_deallocate(mach_task_self(), recv)))
+                XFAIL("mach_port_deallocate:recv", xretval);
+
+        if(reply && (xretval = mach_port_deallocate(mach_task_self(), reply)))
+                XFAIL("mach_port_deallocate:reply", xretval);
+
+        return retval;
+}
+
+static kern_return_t emu_blank_slate(mach_port_t exn_set, task_t *task, thread_t *thread) {
+        kern_return_t retval, xretval;
+        mach_port_t exn = 0;
+        thread_array_t threads = NULL;
+        mach_msg_type_number_t thread_count = 0;
+
+        if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exn)))
+                FAIL("mach_port_allocate", retval);
+
+        if((retval = mach_port_insert_right(mach_task_self(),
+                        exn, exn, MACH_MSG_TYPE_MAKE_SEND)))
+                FAIL("mach_port_insert_right", retval);
+
+        //DEBUG("exn port %d", exn);
+
+        if((retval = emu_spawn(exn, task)))
+                FAIL("emu_spawn", retval);
+
+        if((retval = emu_exn_wait(exn)))
+                FAIL("emu_exn_wait", retval);
+
+        if((retval = mach_port_move_member(mach_task_self(), exn, exn_set)))
+                FAIL("mach_port_move_member", retval);
+
+        if((retval = task_threads(*task, &threads, &thread_count)))
+                FAIL("task_threads", retval);
+
+        *thread = threads[0];
+
+fail:
+        if(retval) {
+                if(task && (xretval = mach_port_deallocate(mach_task_self(), *task)))
+                        XFAIL("mach_port_deallocate:task", xretval);
+        }
+
+        if(threads && (xretval = vm_deallocate(mach_task_self(),
+                        (vm_address_t) threads, sizeof(thread_t) * thread_count)))
+                XFAIL("vm_deallocate:threads", xretval);
 
         return retval;
 }
