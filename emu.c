@@ -1,3 +1,20 @@
+/*
+ *  ZYTOKINE STORM
+ *  Copyright (C) 2015  whitequark@whitequark.org
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License version 3
+ *  as published by the Free Software Foundation.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -9,6 +26,7 @@
 #include <mach/mig.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/Disassembler.h>
 
@@ -16,6 +34,8 @@
 #include <asm-generic/errno.h>
 #include <asm/prctl.h>
 #include <elf.h>
+
+#include "uthash.h"
 
 #define DEBUG1(str) fprintf(stderr, "d: %s: " str "\n", __func__)
 #define DEBUG(fmt, ...) fprintf(stderr, "d: %s: " fmt "\n", __func__, __VA_ARGS__)
@@ -30,41 +50,131 @@ static void fail(const char *fn, const char *reason, kern_return_t retval) {
         fprintf(stderr, "e: %s: %s: %08x %s\n", fn, reason, retval, mach_error_string(retval));
 }
 
-#define SYSCALL_SUSPEND 0x7fffffffffffffff
+static int strace = 0;
+#define STRACE(fmt, ...) do { if(strace) fprintf(stderr, "t: %s: " fmt "\n", __func__, __VA_ARGS__); } while(0)
+
+#define SYSCALL_SUSPENDED       0x7fffffffffffffff
+#define SYSCALL_TERMINATED      0x7ffffffffffffffe
+
+typedef intptr_t userptr_t;
 
 typedef struct {
-        mach_port_t sysret_port;
+        UT_hash_handle hh;
+        /* identity */
         mach_port_t task;
         mach_port_t thread;
+        /* syscall state */
+        mach_port_t sysret_port;
         x86_thread_state64_t *state;
-} syscall_context_t;
+        x86_thread_state64_t state_saved;
+        /* thread-local ptr */
+        uint64_t fsbase;
+        /* userspace asks us to clear this on sys_exit */
+        uint64_t clear_tid_addr;
+} linux_thread_t;
 
-static kern_return_t emu_exn_return(syscall_context_t *context);
+static lock_set_t lock_set = 0;
+static linux_thread_t *threads = NULL;
 
-static void emu_dump_mem(syscall_context_t *context, uint64_t base, uint64_t len) {
+#define LOCK(set, idx) if((retval = lock_acquire(lock_set, 0))) FAIL("lock_acquire", retval);
+#define UNLOCK(set, idx) if((retval = lock_release(lock_set, 0))) FAIL("lock_release", retval);
+
+static void emu_thread_init() {
+        kern_return_t retval;
+        if((retval = lock_set_create(mach_task_self(), &lock_set, 1, SYNC_POLICY_FIFO)))
+                FAIL("lock_set_create", retval);
+
+        return;
+
+fail:   abort();
+}
+
+static linux_thread_t *emu_thread_find(thread_t thread) {
+        kern_return_t retval;
+
+        LOCK(lock_set, 0);
+        linux_thread_t *th;
+        HASH_FIND_INT(threads, &thread, th);
+        ASSERT(th != NULL);
+        UNLOCK(lock_set, 0);
+
+        return th;
+
+fail:   abort();
+}
+
+static linux_thread_t *emu_thread_insert(task_t task, thread_t thread) {
+        kern_return_t retval;
+
+        linux_thread_t *th = calloc(1, sizeof(linux_thread_t));
+        th->task = task;
+        th->thread = thread;
+
+        LOCK(lock_set, 0);
+        //DEBUG("adding thread %d", thread);
+        HASH_ADD_INT(threads, thread, th);
+        UNLOCK(lock_set, 0);
+
+        return th;
+
+fail:   abort();
+}
+
+static void emu_thread_delete(thread_t thread) {
+        kern_return_t retval;
+
+        LOCK(lock_set, 0);
+        linux_thread_t *th;
+        HASH_FIND_INT(threads, &thread, th);
+        ASSERT(th != NULL);
+        HASH_DEL(threads, th);
+        UNLOCK(lock_set, 0);
+
+        free(th);
+        return;
+
+fail:   abort();
+}
+
+static void emu_consider_termination() {
+        kern_return_t retval;
+
+        LOCK(lock_set, 0);
+        if(HASH_COUNT(threads) == 0)
+                exit(0);
+        UNLOCK(lock_set, 0);
+
+        return;
+
+fail:   abort();
+}
+
+static kern_return_t emu_exn_return(linux_thread_t *th);
+
+static void emu_dump_mem(linux_thread_t *th, userptr_t base, uint64_t len) {
         kern_return_t retval;
 
         len += (len % 8 == 0) ? 0 : 8 - len % 8;
 
         uint64_t *local = (uint64_t*) alloca(len);
         vm_size_t vm_len = len / sizeof(natural_t);
-        if((retval = vm_read_overwrite(context->task, base, len, (pointer_t) local, &vm_len)))
+        if((retval = vm_read_overwrite(th->task, base, len, (pointer_t) local, &vm_len)))
                 FAIL("vm_read_overwrite", retval);
 
         for(int i = 0; i < len / sizeof(uint64_t); i++) {
-                DEBUG(" %016llx: %016llx", base + i * sizeof(uint64_t), local[i]);
+                DEBUG(" %016lx: %016llx", base + i * sizeof(uint64_t), local[i]);
         }
 
 fail:   ;
 }
 
-static inline void* emu_map(syscall_context_t *context,
-                            uint64_t ptr, uint64_t len, vm_prot_t prot) {
+static inline void* emu_map(linux_thread_t *th,
+                            userptr_t ptr, uint64_t len, vm_prot_t prot) {
         kern_return_t retval;
         void *out = NULL;
         vm_prot_t cur, max;
         if((retval = vm_remap(mach_task_self(), (vm_address_t*) &out, (vm_size_t) len,
-                        (vm_address_t) 0, TRUE, context->task, (vm_address_t) ptr,
+                        (vm_address_t) 0, TRUE, th->task, (vm_address_t) ptr,
                         FALSE, &cur, &max, VM_INHERIT_NONE)))
                 FAIL("vm_remap", retval);
 
@@ -80,15 +190,15 @@ static inline void* emu_map(syscall_context_t *context,
 fail:   return NULL;
 }
 
-static inline void* emu_map_rw(syscall_context_t *context, uint64_t ptr, uint64_t len) {
-        return emu_map(context, ptr, len, VM_PROT_READ | VM_PROT_WRITE);
+static inline void* emu_map_rw(linux_thread_t *th, userptr_t ptr, uint64_t len) {
+        return emu_map(th, ptr, len, VM_PROT_READ | VM_PROT_WRITE);
 }
 
-static inline const void* emu_map_ro(syscall_context_t *context, uint64_t ptr, uint64_t len) {
-        return emu_map(context, ptr, len, VM_PROT_READ);
+static inline const void* emu_map_ro(linux_thread_t *th, userptr_t ptr, uint64_t len) {
+        return emu_map(th, ptr, len, VM_PROT_READ);
 }
 
-static inline void emu_unmap(syscall_context_t *context, const void *obj, uint64_t len) {
+static inline void emu_unmap(linux_thread_t *th, const void *obj, uint64_t len) {
         kern_return_t retval;
         if((retval = vm_deallocate(mach_task_self(),
                         (vm_address_t) obj & PAGE_MASK, (vm_size_t) len)))
@@ -96,7 +206,43 @@ static inline void emu_unmap(syscall_context_t *context, const void *obj, uint64
 
         return;
 
-fail:   abort();
+fail:   abort(); /* assuming successful emu_map, should never happen */
+}
+
+static inline boolean_t emu_copy_from_user(linux_thread_t *th,
+                userptr_t ptr, void *dst, uint64_t len) {
+        kern_return_t retval;
+
+        ASSERT(len % sizeof(natural_t) == 0);
+
+        vm_size_t count = len;
+        if((retval = vm_read_overwrite(th->task,
+                        (vm_address_t) ptr, len, (vm_address_t) dst, &count)))
+                FAIL("vm_read_overwrite", retval);
+
+        /* whut. the osfmk doc says count is in natural-sized units */
+        ASSERT(count == len);
+
+        return TRUE;
+
+fail:   return FALSE;
+}
+
+static inline boolean_t emu_copy_to_user(linux_thread_t *th,
+                userptr_t ptr, void *src, uint64_t len) {
+        /* vm_write deals in pages. it's faster to map the pages backing dst
+           and read it directly than rmw a page */
+        void *dst;
+        if(!(dst = emu_map_rw(th, ptr, len)))
+                PFAIL("emu_map_rw");
+
+        memcpy(dst, src, len);
+
+        emu_unmap(th, dst, len);
+
+        return TRUE;
+
+fail:   return FALSE;
 }
 
 static inline int emu_ret(int ret) {
@@ -157,117 +303,182 @@ static inline int emu_ret(int ret) {
         }
 }
 
-struct linux_iovec {
-        void *iov_base;
-        size_t iov_len;
-};
-
-static uint64_t emu_write(syscall_context_t *context,
-                uint64_t fd, uint64_t user_ptr, uint64_t len) {
-        DEBUG("fd %lld user_ptr %016llx len %lld", fd, user_ptr, len);
+static uint64_t emu_write(linux_thread_t *th,
+                uint64_t fd, userptr_t user_ptr, uint64_t len) {
+        STRACE("fd %lld user_ptr %016lx len %lld", fd, user_ptr, len);
 
         const void *ptr;
-        if(!(ptr = emu_map_ro(context, user_ptr, len)))
+        if(!(ptr = emu_map_ro(th, user_ptr, len)))
                 return -linux_EFAULT;
 
         int ret = emu_ret(write(fd, ptr, len));
 
-        emu_unmap(context, ptr, len);
+        emu_unmap(th, ptr, len);
 
         return ret;
 }
 
-static uint64_t emu_writev(syscall_context_t *context,
-                uint64_t fd, uint64_t user_iov, uint64_t vlen) {
-        DEBUG("fd %lld user_iov %016llx vlen %lld", fd, user_iov, vlen);
-
-        const struct linux_iovec *iov;
-        if(!(iov = emu_map_ro(context, user_iov, vlen * sizeof(struct linux_iovec))))
-                return -linux_EFAULT;
+static uint64_t emu_writev(linux_thread_t *th,
+                uint64_t fd, userptr_t iov_user_ptr, uint64_t vlen) {
+        STRACE("fd %lld user_iov_ptr %016lx vlen %lld", fd, iov_user_ptr, vlen);
 
         int ret = 0;
+
+        const struct iovec *user_iov = NULL;
+        if(!(user_iov = emu_map_ro(th, iov_user_ptr, vlen * sizeof(struct iovec))))
+                return -linux_EFAULT;
+
+        struct iovec *iov = calloc(vlen, sizeof(struct iovec));
         for(int i = 0; i < vlen; i++) {
-                int pret;
-                if((pret = emu_write(context, fd,
-                                (uint64_t) iov[i].iov_base, iov[i].iov_len)) < 0) {
-                        ret = pret;
+                if(!(iov[i].iov_base = (void*) emu_map_ro(th,
+                                (userptr_t) user_iov[i].iov_base, user_iov[i].iov_len))) {
+                        ret = -linux_EFAULT;
                         goto fail;
-                } else {
-                        ret += pret;
                 }
+                iov[i].iov_len = user_iov[i].iov_len;
         }
 
-fail:   emu_unmap(context, iov, vlen * sizeof(struct linux_iovec));
+        ret = emu_ret(writev(fd, iov, vlen));
+
+fail:   if(iov) {
+                for(int i = 0; i < vlen; i++) {
+                        if(iov->iov_base)
+                                emu_unmap(th, iov->iov_base, iov->iov_len);
+                }
+                free(iov);
+                iov = NULL;
+        }
+
+        emu_unmap(th, iov, vlen * sizeof(struct iovec));
 
         return ret;
 }
 
-static uint64_t emu_mmap(syscall_context_t *context,
-                uint64_t user_start, uint64_t len, uint64_t prot,
+static uint64_t emu_mmap(linux_thread_t *th,
+                userptr_t user_start, uint64_t len, uint64_t prot,
                 uint64_t flags, uint64_t fd, uint64_t off) {
-        DEBUG("user_start %016llx len %lld prot %08llx flags %08llx fd %lld off %08llx",
+        DEBUG("user_start %016lx len %lld prot %08llx flags %08llx fd %lld off %08llx",
               user_start, len, prot, flags, fd, off);
 
         return -linux_ENOSYS;
 }
 
-static uint64_t emu_ioctl(syscall_context_t *contex,
+static uint64_t emu_ioctl(linux_thread_t *contex,
                 uint64_t fd, uint64_t cmd, uint64_t arg) {
         DEBUG("fd %lld cmd %08llx arg %016llx", fd, cmd, arg);
 
         return -linux_ENOSYS;
 }
 
-static uint64_t emu_exit(syscall_context_t *context,
-                uint64_t code) {
-        DEBUG("code %lld", code);
-        thread_terminate(context->task);
-        return SYSCALL_SUSPEND;
-}
-
-static uint64_t emu_arch_prctl(syscall_context_t *context,
-                uint64_t code, uint64_t user_addr) {
-        DEBUG("code %04llx user_addr %016llx", code, user_addr);
+static uint64_t emu_arch_prctl(linux_thread_t *th,
+                uint64_t code, userptr_t user_addr) {
+        STRACE("code %04llx user_addr %016lx", code, user_addr);
 
         switch(code) {
+        case ARCH_GET_FS:
+                if(!emu_copy_to_user(th, user_addr, &th->fsbase, sizeof(th->fsbase)))
+                        return -linux_EFAULT;
+                break;
+
+        case ARCH_SET_FS:
+                if(!emu_copy_from_user(th, user_addr, &th->fsbase, sizeof(th->fsbase)))
+                        return -linux_EFAULT;
+                break;
+
         default:
                 DEBUG("unhandled arch_prctl(%04llx)", code);
                 return -linux_EINVAL;
         }
+
+        return 0;
 }
 
-static uint64_t emu_exit_group(syscall_context_t *context,
+static uint64_t emu_exit(linux_thread_t *th,
                 uint64_t code) {
-        DEBUG("code %lld", code);
-        task_terminate(context->task);
-        return SYSCALL_SUSPEND;
+        STRACE("code %lld", code);
+
+        kern_return_t retval;
+        if((retval = thread_terminate(th->thread)))
+                FAIL("thread_terminate", retval);
+
+        /* bad pointer? userspace will just have to deal */
+        if(th->clear_tid_addr) {
+                uint64_t zero = 0;
+                emu_copy_to_user(th, th->clear_tid_addr, &zero, sizeof(zero));
+                /* TODO: wake up futex at clear_tid_addr */
+        }
+
+        emu_thread_delete(th->thread);
+
+        emu_consider_termination();
+
+        return SYSCALL_TERMINATED;
+
+fail:   abort();
+}
+
+static uint64_t emu_exit_group(linux_thread_t *th,
+                uint64_t code) {
+        STRACE("code %lld", code);
+
+        kern_return_t retval, xretval;
+        thread_array_t threads = NULL;
+        mach_msg_type_number_t thread_count = 0;
+        if((retval = task_threads(th->task, &threads, &thread_count)))
+                FAIL("task_threads", retval);
+
+        for(int i = 0; i < thread_count; i++) {
+                if((retval = thread_terminate(threads[i])))
+                        FAIL("thread_terminate", retval);
+                emu_thread_delete(threads[i]);
+        }
+
+        if(threads && (xretval = vm_deallocate(mach_task_self(),
+                        (vm_address_t) threads, sizeof(thread_t) * thread_count)))
+                XFAIL("vm_deallocate:threads", xretval);
+
+        emu_consider_termination();
+
+        return SYSCALL_TERMINATED;
+
+fail:   abort();
+}
+
+static uint64_t emu_set_tid_address(linux_thread_t *th,
+                userptr_t user_addr) {
+        STRACE("user_addr %016lx", user_addr);
+
+        th->clear_tid_addr = user_addr;
+
+        /* return linux pid, i.e. mach thread id */
+        return th->thread;
 }
 
 #define SYSCALL1(fn) \
-        case __NR_ ## fn: retval = emu_ ## fn (context, \
+        case __NR_ ## fn: retval = emu_ ## fn (th, \
                 state->__rdi); break;
 #define SYSCALL2(fn) \
-        case __NR_ ## fn: retval = emu_ ## fn (context, \
+        case __NR_ ## fn: retval = emu_ ## fn (th, \
                 state->__rdi, state->__rsi); break;
 #define SYSCALL3(fn) \
-        case __NR_ ## fn: retval = emu_ ## fn (context, \
+        case __NR_ ## fn: retval = emu_ ## fn (th, \
                 state->__rdi, state->__rsi, state->__rdx); break;
 #define SYSCALL4(fn) \
-        case __NR_ ## fn: retval = emu_ ## fn (context, \
+        case __NR_ ## fn: retval = emu_ ## fn (th, \
                 state->__rdi, state->__rsi, state->__rdx, \
                 state->__rcx); break;
 #define SYSCALL5(fn) \
-        case __NR_ ## fn: retval = emu_ ## fn (context, \
+        case __NR_ ## fn: retval = emu_ ## fn (th, \
                 state->__rdi, state->__rsi, state->__rdx, \
                 state->__rcx, state->__r8); break;
 #define SYSCALL6(fn) \
-        case __NR_ ## fn: retval = emu_ ## fn (context, \
+        case __NR_ ## fn: retval = emu_ ## fn (th, \
                 state->__rdi, state->__rsi, state->__rdx, \
                 state->__rcx, state->__r8, state->__r9); break;
 
-static boolean_t emu_syscall(syscall_context_t *context) {
+static boolean_t emu_syscall(linux_thread_t *th) {
         uint64_t retval = 0;
-        x86_thread_state64_t *state = context->state;
+        x86_thread_state64_t *state = th->state;
 
         switch(state->__rax) {
                 SYSCALL3(write);
@@ -277,21 +488,21 @@ static boolean_t emu_syscall(syscall_context_t *context) {
                 SYSCALL1(exit);
                 SYSCALL2(arch_prctl);
                 SYSCALL1(exit_group);
-
-        /* pseudo-syscall indicating macho stub handoff */
-        case 0xffff:
-                if((retval = thread_suspend(context->thread)))
-                        FAIL("thread_suspend", retval);
-                break;
+                SYSCALL1(set_tid_address);
 
         default:
                 DEBUG("unknown syscall %lld", state->__rax);
                 goto fail;
         }
 
-        if(retval != SYSCALL_SUSPEND) {
+        if(retval == SYSCALL_TERMINATED) {
+                /* do nothing */
+        } if(retval == SYSCALL_SUSPENDED) {
+                memcpy(&th->state_saved, state, sizeof(x86_thread_state64_t));
+                th->state = &th->state_saved;
+        } else {
                 state->__rax = retval;
-                emu_exn_return(context);
+                emu_exn_return(th);
         }
 
         return TRUE;
@@ -330,15 +541,29 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
         if((retval = mach_msg_receive(&exn_req.hdr)))
                 FAIL("mach_msg_receive", retval);
 
-        x86_thread_state64_t *state = (x86_thread_state64_t*) exn_req.state;
-        syscall_context_t context = {
-                .sysret_port = exn_req.hdr.msgh_remote_port,
-                .task = exn_req.task_port.name,
-                .thread = exn_req.thread_port.name,
-                .state = state,
-        };
+        if(exn_req.exception == EXC_SYSCALL && exn_req.code[0] == 0xffff) {
+                /* mach-o trampoline handoff */
+                if((retval = thread_suspend(exn_req.thread_port.name)))
+                        FAIL("thread_suspend", retval);
 
-        if(exn_req.exception == EXC_SYSCALL && emu_syscall(&context)) {
+                /* we don't have linux_thread_t here yet, construct a fake one
+                   to perform exception return */
+
+                linux_thread_t th = {
+                        .sysret_port = exn_req.hdr.msgh_remote_port,
+                        .state = (x86_thread_state64_t*) &exn_req.state,
+                };
+                if((retval = emu_exn_return(&th)))
+                        FAIL("emu_exn_return", retval);
+
+                return KERN_SUCCESS;
+        }
+
+        linux_thread_t *th = emu_thread_find(exn_req.thread_port.name);
+        th->sysret_port = exn_req.hdr.msgh_remote_port;
+        th->state = (x86_thread_state64_t*) exn_req.state;
+
+        if(exn_req.exception == EXC_SYSCALL && emu_syscall(th)) {
                 /* handled */
         } else {
                 const char* exn_str = "(unknown)";
@@ -362,20 +587,20 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
                 }
                 DEBUG("exception %d (%s) %016llx %016llx",
                       exn_req.exception, exn_str, exn_req.code[0], exn_req.code[1]);
-                DEBUG("RAX %016llx R8  %016llx", state->__rax, state->__r8);
-                DEBUG("RBX %016llx R9  %016llx", state->__rbx, state->__r9);
-                DEBUG("RCX %016llx R10 %016llx", state->__rcx, state->__r10);
-                DEBUG("RDX %016llx R11 %016llx", state->__rdx, state->__r11);
-                DEBUG("RDI %016llx R12 %016llx", state->__rdi, state->__r12);
-                DEBUG("RSI %016llx R13 %016llx", state->__rsi, state->__r13);
-                DEBUG("RBP %016llx R14 %016llx", state->__rbp, state->__r14);
-                DEBUG("RSP %016llx R15 %016llx", state->__rsp, state->__r15);
-                DEBUG("RIP %016llx RFLAGS %016llx", state->__rip, state->__rflags);
+                DEBUG("RAX %016llx R8  %016llx", th->state->__rax, th->state->__r8);
+                DEBUG("RBX %016llx R9  %016llx", th->state->__rbx, th->state->__r9);
+                DEBUG("RCX %016llx R10 %016llx", th->state->__rcx, th->state->__r10);
+                DEBUG("RDX %016llx R11 %016llx", th->state->__rdx, th->state->__r11);
+                DEBUG("RDI %016llx R12 %016llx", th->state->__rdi, th->state->__r12);
+                DEBUG("RSI %016llx R13 %016llx", th->state->__rsi, th->state->__r13);
+                DEBUG("RBP %016llx R14 %016llx", th->state->__rbp, th->state->__r14);
+                DEBUG("RSP %016llx R15 %016llx", th->state->__rsp, th->state->__r15);
+                DEBUG("RIP %016llx RFLAGS %016llx", th->state->__rip, th->state->__rflags);
 
                 uint64_t stack[10] = {0xBAAAAAAAAAAAAAAD};
-                uint64_t rsp_low = state->__rsp;
+                uint64_t rsp_low = th->state->__rsp;
                 vm_size_t rsp_len = sizeof(stack) / sizeof(natural_t);
-                if((retval = vm_read_overwrite(context.task, rsp_low, sizeof(stack),
+                if((retval = vm_read_overwrite(th->task, rsp_low, sizeof(stack),
                                 (pointer_t) stack, &rsp_len))) {
                         DEBUG1("rsp points to nowhere");
                         goto nostack;
@@ -384,7 +609,7 @@ static kern_return_t emu_exn_wait(mach_port_t exn_set) {
                 DEBUG1("stack:");
                 for(int i = 0; i < sizeof(stack) / sizeof(stack[0]); i++) {
                         const char *arrow =
-                                (rsp_low + i * sizeof(stack[0]) == state->__rsp) ? "=>" : "  ";
+                                (rsp_low + i * sizeof(stack[0]) == th->state->__rsp) ? "=>" : "  ";
                         DEBUG(" %s %016llx: %016llx", arrow,
                               rsp_low + i * sizeof(stack[0]), stack[i]);
                 }
@@ -393,7 +618,7 @@ nostack: ;
                 uint8_t insns_begin[256];
                 uint8_t *insns = insns_begin, *insns_end;
                 vm_size_t rip_len = sizeof(insns_begin) / sizeof(natural_t);
-                if((retval = vm_read_overwrite(context.task, state->__rip, sizeof(insns_begin),
+                if((retval = vm_read_overwrite(th->task, th->state->__rip, sizeof(insns_begin),
                                 (pointer_t) insns_begin, &rip_len))) {
                         DEBUG1("rip points to nowhere");
                         goto nodisasm;
@@ -411,7 +636,7 @@ nostack: ;
                 DEBUG1("disasm:");
                 for(int i = 0; i < 10; i++) {
                         char mnemonic[256] = {0};
-                        uint64_t rip = state->__rip + (insns - insns_begin);
+                        uint64_t rip = th->state->__rip + (insns - insns_begin);
                         size_t insn_len = LLVMDisasmInstruction(Disasm, insns, insns_end - insns,
                                 rip, mnemonic, sizeof(mnemonic));
 
@@ -439,11 +664,11 @@ nodisasm: ;
 
                 if(exn_req.exception == EXC_BREAKPOINT) {
                         getchar();
-                        emu_exn_return(&context);
+                        emu_exn_return(th);
 
                         retval = KERN_SUCCESS;
                 } else {
-                        if((retval = task_terminate(context.task)))
+                        if((retval = task_terminate(th->task)))
                                 FAIL("task_terminate", retval);
 
                         retval = KERN_FAILURE;
@@ -454,7 +679,7 @@ fail:
         return retval;
 }
 
-static kern_return_t emu_exn_return(syscall_context_t *context) {
+static kern_return_t emu_exn_return(linux_thread_t *th) {
         kern_return_t retval;
 
         struct {
@@ -466,16 +691,19 @@ static kern_return_t emu_exn_return(syscall_context_t *context) {
                 x86_thread_state64_t state;
         } __attribute__((packed)) exn_rep = {{0}};
         exn_rep.hdr.msgh_size = sizeof(exn_rep);
-        exn_rep.hdr.msgh_remote_port = context->sysret_port;
+        exn_rep.hdr.msgh_remote_port = th->sysret_port;
         exn_rep.hdr.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_MOVE_SEND_ONCE);
         exn_rep.hdr.msgh_id = 2507; /* reply to EXCEPTION_STATE_IDENTITY */
         exn_rep.NDR = NDR_record;
         exn_rep.ret_code = KERN_SUCCESS;
         exn_rep.flavor = x86_THREAD_STATE64;
         exn_rep.state_len = sizeof(exn_rep.state) / sizeof(natural_t);
-        memcpy(&exn_rep.state, context->state, sizeof(exn_rep.state));
+        memcpy(&exn_rep.state, th->state, sizeof(exn_rep.state));
         if((retval = mach_msg_send(&exn_rep.hdr)))
                 FAIL("mach_msg_send", retval);
+
+        /* the thread is resumed and the state is no longer valid */
+        th->state = NULL;
 
 fail:   return retval;
 }
@@ -672,7 +900,7 @@ static kern_return_t emu_spawn(mach_port_t exn, mach_port_t *task) {
         if(!(pid = fork()))
                 emu_spawn_helper();
 
-        DEBUG("pid %d", pid);
+        //DEBUG("pid %d", pid);
 
         if((retval = task_set_bootstrap_port(mach_task_self(), old_bootstrap)))
                 FAIL("task_set_bootstrap_port", retval);
@@ -751,6 +979,8 @@ static kern_return_t emu_blank_slate(mach_port_t exn_set, task_t *task, thread_t
 
         *thread = threads[0];
 
+        emu_thread_insert(*task, *thread);
+
 fail:
         if(retval) {
                 if(task && (xretval = mach_port_deallocate(mach_task_self(), *task)))
@@ -767,6 +997,8 @@ fail:
 static void happy_dance(const char *init) {
         kern_return_t retval;//, xretval;
         mach_port_t exn_set = 0;
+
+        emu_thread_init();
 
         if((retval = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &exn_set)))
                 FAIL("mach_port_allocate", retval);
@@ -796,6 +1028,9 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "usage: %s [init]\n", argv[0]);
                 return 1;
         }
+
+        if(getenv("STRACE"))
+                strace = 1;
 
         happy_dance(argv[1]);
 }

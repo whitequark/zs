@@ -1,9 +1,10 @@
 all: empty emu
 
 LLVM = $(shell llvm-config --cflags --ldflags --system-libs --libs mcdisassembler x86)
+CFLAGS = -g3 -lc++ $(LLVM) -Iinclude -Wall -Werror -Wno-unused-function
 
-emu: emu.c
-	clang -g2 -lc++ $(LLVM) -Iinclude -Wall -Werror -Wno-unused-function $^ -o $@
+emu: emu.c uthash.h
+	clang -O0 $(CFLAGS) $(filter %.c,$^) -o $@
 
 empty.o: empty.s
 	as $< -o $@
