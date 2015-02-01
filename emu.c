@@ -871,7 +871,7 @@ static void emu_spawn_helper() {
                 FAIL("task_set_bootstrap_port", retval);
 
         char *argv[] = {0}, *envp[] = {0};
-        execve("./empty", argv, envp);
+        execve("./linux-process", argv, envp);
 
 fail:
         exit(1);

@@ -1,5 +1,5 @@
 *.dSYM
 *.o
 emu
-empty
+linux-process
 app
